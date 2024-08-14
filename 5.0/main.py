@@ -16,7 +16,7 @@ class AnalyzerThread(QThread):
         super().__init__()
         self.list_views = list_views
         self.analyzer = None
-
+    # 모든 지점 번호
     # def run(self):
     #     total_area = [
     #         "0011", "0012", "0013", "0021", "0022", "0023",
@@ -43,6 +43,7 @@ class AnalyzerThread(QThread):
     #         "0431", "0432", "0433", "0441", "0442", "0443",
     #         "0451", "0452", "0453"
     #     ]
+    # 수정 지점 번호
     def run(self):
         total_area = [
             "0011", "0012", "0013", "0022", "0023",
