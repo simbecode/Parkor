@@ -4,9 +4,14 @@
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[('C:\\Users\\SITECH\\.conda\\envs\\SI70\\DLLs\\pyexpat.pyd', '.'), ('C:\\Users\\SITECH\\.conda\\envs\\SI70\\Library\\bin\\expat.dll', '.'), ('C:\\Users\\SITECH\\.conda\\envs\\SI70\\Library\\bin\\libexpat.dll', '.')],
+    binaries=[],
     datas=[('main.ui', '.'), ('icon.ico', '.')],
-    hiddenimports=['pyexpat', 'xml.parsers.expat'],
+    hiddenimports=[
+        'pyexpat',
+        'xml.parsers.expat',
+        'PyQt5.QtWebEngineWidgets',
+        'PyQt5.QtWebEngineCore',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -19,9 +24,8 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='ParkorAnalyzer',
     debug=False,
     bootloader_ignore_signals=False,
@@ -36,4 +40,14 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=['icon.ico'],
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='ParkorAnalyzer',
 )

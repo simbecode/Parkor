@@ -1,6 +1,7 @@
 # PyInstaller 생성 파일
 **/build/
 **/dist/
+release/
 
 # Python 캐시
 **/__pycache__/
@@ -9,3 +10,13 @@
 # 가상환경
 venv/
 .venv/
+
+# 편집기 설정
+.vscode/
+.idea/
+
+# 실행 중 생성될 수 있는 파일
+*.log
+*.tmp
+*.dmp
+debug.log

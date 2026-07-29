@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import logging
 import datetime as dt
 import pandas as pd
@@ -10,7 +11,159 @@ from utils import calculate_values_count, calculate_page_count, get_area_name, g
 from settings_dialog import SettingsDialog
 from PyQt5 import QtWidgets, uic, QtCore
 from PyQt5.QtCore import QThread, pyqtSignal, QStringListModel, QUrl
-from PyQt5.QtGui import QDesktopServices, QIcon
+from PyQt5.QtGui import QIcon, QKeySequence
+
+APP_VERSION = "6.2"
+
+
+class PandasTableModel(QtCore.QAbstractTableModel):
+    """상세 창에서 pandas DataFrame을 읽기 전용으로 표시하는 모델."""
+
+    def __init__(self, data=None, parent=None):
+        super().__init__(parent)
+        self._data = data if data is not None else pd.DataFrame()
+
+    def rowCount(self, parent=QtCore.QModelIndex()):
+        return 0 if parent.isValid() else len(self._data.index)
+
+    def columnCount(self, parent=QtCore.QModelIndex()):
+        return 0 if parent.isValid() else len(self._data.columns)
+
+    def data(self, index, role=QtCore.Qt.DisplayRole):
+        if not index.isValid() or role != QtCore.Qt.DisplayRole:
+            return None
+        value = self._data.iat[index.row(), index.column()]
+        try:
+            if pd.isna(value):
+                return ""
+        except (TypeError, ValueError):
+            pass
+        column = self._data.columns[index.column()]
+        column_text = (
+            " ".join(str(part) for part in column)
+            if isinstance(column, tuple)
+            else str(column)
+        )
+        if "차이" in column_text:
+            try:
+                return f"{float(value):.2f}"
+            except (TypeError, ValueError):
+                pass
+        return str(value)
+
+    def headerData(self, section, orientation, role=QtCore.Qt.DisplayRole):
+        if role != QtCore.Qt.DisplayRole:
+            return None
+        if orientation == QtCore.Qt.Horizontal:
+            column = self._data.columns[section]
+            if isinstance(column, tuple):
+                parts = [
+                    str(part) for part in column
+                    if str(part) and not str(part).startswith("Unnamed:")
+                ]
+                if not parts:
+                    return ""
+
+                group = parts[0]
+                measurement = parts[-1]
+                measurement = (
+                    measurement
+                    .replace("(㎍/m³)", "")
+                    .replace("(ug/m³)", "")
+                    .replace("(℃)", "")
+                    .replace("(%)", "")
+                    .replace("(㎧)", "")
+                    .replace("(degree)", "")
+                    .strip()
+                )
+
+                if group == "산림 미세먼지 농도":
+                    return f"산림 {measurement}"
+                if group == "산업유래 휘발성유기화합물 미세먼지 농도":
+                    return f"산업 {measurement}"
+                if group == "관측시간":
+                    return "관측시간"
+                return measurement
+            return str(column)
+        return str(self._data.index[section])
+
+
+def filter_detail_data(raw_data, issue_type, negative_tail=6):
+    """목록의 이상 유형에 맞는 행만 상세 표에 반환한다."""
+    if raw_data is None or raw_data.empty:
+        return pd.DataFrame()
+
+    data = raw_data.copy()
+
+    if issue_type == "누락 데이터":
+        if "관측시간" not in data.columns:
+            return pd.DataFrame()
+
+        observed = pd.to_datetime(
+            data["관측시간"].iloc[:, 0]
+            if isinstance(data["관측시간"], pd.DataFrame)
+            else data["관측시간"],
+            errors="coerce"
+        ).dropna()
+        expected_count = calculate_values_count()
+        if expected_count <= 0:
+            return pd.DataFrame(columns=["관측시간", "상태"])
+
+        today = pd.Timestamp.now().normalize()
+        expected = pd.date_range(today, periods=expected_count, freq="10min")
+        missing = expected.difference(pd.DatetimeIndex(observed))
+        return pd.DataFrame({
+            "관측시간": missing.strftime("%Y-%m-%d %H:%M"),
+            "상태": "누락"
+        })
+
+    if issue_type == "제로값 발생":
+        try:
+            particulate = data[[
+                "산림 미세먼지 농도",
+                "산업유래 휘발성유기화합물 미세먼지 농도"
+            ]]
+        except KeyError:
+            return pd.DataFrame()
+        numeric = particulate.apply(pd.to_numeric, errors="coerce")
+        return data.loc[numeric.eq(0).any(axis=1)].copy()
+
+    if issue_type == "통합 센서 문제":
+        weather_columns = ["온도(℃)", "습도(%)", "풍속(㎧)", "풍향(degree)"]
+        try:
+            weather = data[weather_columns]
+        except KeyError:
+            return pd.DataFrame()
+        return data.loc[weather.isna().any(axis=1)].copy()
+
+    if issue_type == "차이값 음수 문제":
+        try:
+            particulate = data[[
+                "산림 미세먼지 농도",
+                "산업유래 휘발성유기화합물 미세먼지 농도"
+            ]].iloc[:-2]
+        except KeyError:
+            return pd.DataFrame()
+        if particulate.shape[1] != 6:
+            return pd.DataFrame()
+
+        numeric = particulate.apply(pd.to_numeric, errors="coerce")
+        differences = numeric.iloc[:, :3].to_numpy() - numeric.iloc[:, 3:6].to_numpy()
+        difference_data = pd.DataFrame(
+            differences,
+            index=particulate.index,
+            columns=["PM10 차이", "PM2.5 차이", "PM1.0 차이"]
+        )
+        recent = difference_data.tail(negative_tail)
+        negative_rows = recent.lt(0).any(axis=1)
+        indexes = recent.index[negative_rows]
+        result = data.loc[indexes].copy()
+        for column in difference_data.columns:
+            result[column] = difference_data.loc[indexes, column]
+        return result
+
+    return data
+
 
 class AnalyzerThread(QThread):
     analysis_done = pyqtSignal(object)   # 분석 완료 시그널
@@ -98,6 +251,9 @@ class AnalyzerThread(QThread):
         for area in total_area:
             area_name = get_area_name(area)
             data = fetched.get(area, pd.DataFrame())
+            # 표시 문자열(지점명)이 변경되더라도 상세 데이터 조회가 깨지지
+            # 않도록 서버 요청에 사용한 관측소 코드를 기준으로도 보관한다.
+            self.analyzer.raw_data_by_area_code[area] = data.copy()
             self.analyzer.analyze_data(data, area_name)
 
         self.analysis_done.emit(self.analyzer)
@@ -124,9 +280,11 @@ def start_analysis(window):
     zero_threshold    = SettingsDialog.load_zero_threshold()
 
     analyzer_thread = AnalyzerThread(list_views, total_area, missing_threshold, negative_tail, zero_threshold)
+    window.current_analyzer = None
 
     def on_analysis_done(analyzer):
         analyzer_thread.status_update.disconnect()  # 완료 후 상태바 덮어쓰기 방지
+        window.current_analyzer = analyzer
         display_results(analyzer, window)
 
     analyzer_thread.analysis_done.connect(on_analysis_done)
@@ -135,13 +293,17 @@ def start_analysis(window):
     return analyzer_thread
 
 class DetailDialog(QtWidgets.QDialog):
-    def __init__(self, parent, area_name, area_code, issue_type, raw_text, start, end):
+    def __init__(
+        self, parent, area_name, area_code, issue_type, raw_text, start, end,
+        raw_data=None, negative_tail=6
+    ):
         super().__init__(parent)
         self.area_code = area_code
         self.start = start
         self.end = end
         self.setWindowTitle("상세 보기")
-        self.setMinimumWidth(360)
+        self.resize(1100, 650)
+        self.setMinimumSize(700, 450)
 
         layout = QtWidgets.QVBoxLayout(self)
         form = QtWidgets.QFormLayout()
@@ -155,9 +317,60 @@ class DetailDialog(QtWidgets.QDialog):
         form.addRow("상세 내용", detail_label)
         layout.addLayout(form)
 
+        filtered_data = filter_detail_data(raw_data, issue_type, negative_tail)
+        layout.addWidget(QtWidgets.QLabel(f"필터된 원본 데이터 — {issue_type}"))
+        self.data_table = QtWidgets.QTableView()
+        self.data_model = PandasTableModel(filtered_data, self.data_table)
+        self.data_table.setModel(self.data_model)
+        self.data_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.data_table.setAlternatingRowColors(True)
+        self.data_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.data_table.setSortingEnabled(False)
+        self.data_table.setWordWrap(False)
+        self.data_table.setTextElideMode(QtCore.Qt.ElideNone)
+        self.data_table.setStyleSheet(
+            "QTableView::item { padding-left: 3px; padding-right: 3px; }"
+            "QHeaderView::section { padding-left: 3px; padding-right: 3px; }"
+        )
+        self.data_table.verticalHeader().setDefaultSectionSize(27)
+        self.data_table.verticalHeader().setMinimumWidth(28)
+        self.data_table.verticalHeader().setMaximumWidth(42)
+        self.data_table.horizontalHeader().setMinimumSectionSize(55)
+        self.data_table.horizontalHeader().setMaximumSectionSize(420)
+        self.data_table.setHorizontalScrollMode(
+            QtWidgets.QAbstractItemView.ScrollPerPixel)
+        header = self.data_table.horizontalHeader()
+        header.setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
+        header.setDefaultSectionSize(82)
+        header.setStretchLastSection(False)
+
+        # 관측시간을 제외한 측정값 컬럼은 남은 폭을 균등 분배한다.
+        # 상세창 크기가 달라져도 전체 센서 값이 한 화면에 들어온다.
+        for column_index in range(self.data_model.columnCount()):
+            column_name = self.data_model.headerData(
+                column_index, QtCore.Qt.Horizontal, QtCore.Qt.DisplayRole
+            )
+            if column_name == "관측시간":
+                header.setSectionResizeMode(
+                    column_index, QtWidgets.QHeaderView.Fixed)
+                self.data_table.setColumnWidth(column_index, 132)
+            elif self.data_model.columnCount() >= 6:
+                header.setSectionResizeMode(
+                    column_index, QtWidgets.QHeaderView.Stretch)
+            else:
+                self.data_table.setColumnWidth(column_index, 100)
+        layout.addWidget(self.data_table, 1)
+
+        if filtered_data.empty:
+            empty_label = QtWidgets.QLabel(
+                "이 필터 조건에 해당하는 원본 데이터가 없습니다."
+            )
+            empty_label.setStyleSheet("color: gray;")
+            layout.addWidget(empty_label)
+
         button_row = QtWidgets.QHBoxLayout()
         button_row.addStretch()
-        open_button = QtWidgets.QPushButton("브라우저 열기")
+        open_button = QtWidgets.QPushButton("연동 사이트 열기")
         close_button = QtWidgets.QPushButton("닫기")
         open_button.clicked.connect(self.open_in_browser)
         close_button.clicked.connect(self.accept)
@@ -167,7 +380,7 @@ class DetailDialog(QtWidgets.QDialog):
 
     def open_in_browser(self):
         if self.parent():
-            self.parent().open_in_browser(self.area_code, "1", self.start, self.end)
+            self.parent().open_in_browser(self.area_code, self.start, self.end)
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -181,7 +394,8 @@ class MainWindow(QtWidgets.QMainWindow):
             base_path = os.path.dirname(__file__)
 
         uic.loadUi(os.path.join(base_path, 'main.ui'), self)
-        self.setWindowTitle(f"{self.windowTitle()} 6.1")
+        self.setWindowTitle(f"{self.windowTitle()} {APP_VERSION}")
+        self.current_analyzer = None
 
         icon_path = os.path.join(base_path, 'icon.ico')
         if os.path.exists(icon_path):
@@ -236,7 +450,15 @@ class MainWindow(QtWidgets.QMainWindow):
             start = dt.datetime.now().strftime('%Y-%m-%d')
             end = dt.datetime.now().strftime('%Y-%m-%d')
             issue_type = self.get_issue_type(self.sender())
-            dlg = DetailDialog(self, area_name, area_code, issue_type, text, start, end)
+            raw_data = None
+            negative_tail = SettingsDialog.load_negative_tail()
+            if self.current_analyzer is not None:
+                raw_data = self.current_analyzer.raw_data_by_area_code.get(area_code)
+                negative_tail = self.current_analyzer.negative_tail
+            dlg = DetailDialog(
+                self, area_name, area_code, issue_type, text, start, end,
+                raw_data, negative_tail
+            )
             dlg.exec_()
 
     def get_issue_type(self, list_view):
@@ -259,16 +481,81 @@ class MainWindow(QtWidgets.QMainWindow):
         logging.warning(f"area_code 조회 실패 — area_name: '{area_name}'")
         return ""
 
-    def open_in_browser(self, area_code, page, start, end):
-        base_url = "https://aican.nifos.go.kr/data/pastInfoVw.do"
-        full_url = f"{base_url}?obsrrTpCd={area_code}&pageIndex={page}&fromDate={start}&toDate={end}"
-        url = QUrl(full_url)
-        if QDesktopServices.openUrl(url):
-            print(f"Opened {url.toString()} in default browser.")
-        else:
-            print(f"Failed to open {url.toString()}.")
+    def open_in_browser(self, area_code, start, end):
+        try:
+            from PyQt5.QtWebEngineWidgets import QWebEngineView
+        except ImportError:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "웹 연동 모듈 없음",
+                "자동 지점 선택에는 PyQtWebEngine이 필요합니다.\n"
+                "다음 명령으로 설치한 뒤 다시 실행해 주세요.\n\n"
+                "pip install PyQtWebEngine"
+            )
+            return
+
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(
+            f"공식 측정데이터 — {get_area_name(area_code)} ({area_code})"
+        )
+        dialog.resize(1280, 820)
+        dialog.setMinimumSize(900, 600)
+
+        close_shortcut = QtWidgets.QShortcut(
+            QKeySequence(QtCore.Qt.Key_Escape), dialog
+        )
+        close_shortcut.setContext(QtCore.Qt.ApplicationShortcut)
+        close_shortcut.activated.connect(dialog.reject)
+
+        layout = QtWidgets.QVBoxLayout(dialog)
+        info = QtWidgets.QLabel(
+            f"관측지점: {get_area_name(area_code)} ({area_code})"
+            f"  |  조회일: {start if start == end else f'{start} ~ {end}'}"
+        )
+        layout.addWidget(info)
+
+        web_view = QWebEngineView(dialog)
+        layout.addWidget(web_view, 1)
+
+        area_json = json.dumps(area_code)
+        start_json = json.dumps(start)
+        end_json = json.dumps(end)
+        integration_script = f"""
+            (function() {{
+                var attempts = 0;
+                var timer = setInterval(function() {{
+                    attempts += 1;
+                    var area = document.getElementById('groupCd');
+                    var from = document.getElementById('fromDt');
+                    var to = document.getElementById('toDt');
+
+                    if (area && from && to && typeof fnGetPastInfoVw === 'function') {{
+                        area.value = {area_json};
+                        from.value = {start_json};
+                        to.value = {end_json};
+                        area.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        fnGetPastInfoVw(1);
+                        clearInterval(timer);
+                    }} else if (attempts >= 40) {{
+                        clearInterval(timer);
+                    }}
+                }}, 250);
+            }})();
+        """
+
+        def apply_station_filter(ok):
+            if ok:
+                web_view.page().runJavaScript(integration_script)
+
+        web_view.loadFinished.connect(apply_station_filter)
+        web_view.setUrl(
+            QUrl("https://aican.nifos.go.kr/data/obsrrData.do?tabNo=2")
+        )
+        dialog.exec_()
 
 def main():
+    # Qt WebEngine을 사용하는 상세 연동창보다 먼저 공유 OpenGL 컨텍스트 설정
+    QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_ShareOpenGLContexts)
     app = QtWidgets.QApplication(sys.argv)
     window = MainWindow()
     window.show()

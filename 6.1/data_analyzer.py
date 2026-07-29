@@ -18,6 +18,9 @@ class DataAnalyzer:
         self.missing_threshold = missing_threshold  # 누락 데이터 허용 오차
         self.negative_tail = negative_tail          # 음수 판정 구간
         self.zero_threshold = zero_threshold        # 제로값 최소 개수
+        # 상세 보기에서 서버 응답 원본을 다시 요청하지 않고 표시하기 위한 캐시
+        self.raw_data_by_area = {}
+        self.raw_data_by_area_code = {}
 
     def set_values_count(self, values_cnt):
         self.values_cnt = values_cnt
@@ -27,6 +30,7 @@ class DataAnalyzer:
         return filtered_data
 
     def analyze_data(self, data_concat, bad_area):
+        self.raw_data_by_area[bad_area] = data_concat.copy()
         data_concat = self.clean_data(data_concat)
         if data_concat.empty:
             self.final_count_data_zero.append(bad_area)
